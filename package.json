@@ -1,0 +1,15 @@
+{
+  "name": "secure-file-hub",
+  "version": "1.0.0",
+  "description": "Secure File Hub - MERN Cloud Storage and File Management Platform",
+  "scripts": {
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "start:backend": "cd backend && npm start",
+    "build:frontend": "cd frontend && npm run build",
+    "seed": "cd backend && npm run seed"
+  },
+  "keywords": ["mern", "cloud-storage", "google-drive-clone", "file-manager", "mongodb", "express", "react", "node"],
+  "author": "Secure File Hub Team",
+  "license": "MIT"
+}
