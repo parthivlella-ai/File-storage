@@ -7,6 +7,7 @@ const {
   getFileById,
   downloadFile,
   previewFile,
+  getFileSignedUrl,
   updateFile,
   moveToTrash,
   batchActions,
@@ -17,6 +18,7 @@ const upload = require('../middleware/uploadMiddleware');
 // Public/Token routes for direct preview/download links
 router.get('/:id/download', downloadFile);
 router.get('/:id/preview', previewFile);
+router.get('/:id/signed-url', getFileSignedUrl);
 
 // Protected routes
 router.use(protect);

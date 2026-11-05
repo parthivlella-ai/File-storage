@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const File = require('../models/File');
 const Folder = require('../models/Folder');
 const User = require('../models/User');
@@ -61,18 +62,45 @@ const uploadFiles = async (req, res, next) => {
       const ext = path.extname(sanitizedName).toLowerCase().replace('.', '');
       const category = detectCategory(sanitizedName, file.mimetype);
 
-      const newFile = await File.create({
-        originalName: sanitizedName,
-        storedName: file.filename,
-        filePath: file.path,
-        mimeType: file.mimetype || 'application/octet-stream',
-        extension: ext,
-        size: file.size,
-        category,
-        owner: req.user._id,
-        folder: targetFolder ? targetFolder._id : null,
-        shareToken: crypto.randomBytes(16).toString('hex'),
-      });
+      // Upload file via storage abstraction (uploads to Cloud R2/S3 or keeps in Local)
+      let uploadResult;
+      try {
+        uploadResult = await storageEngine.uploadFile({
+          userId: req.user._id,
+          originalName: sanitizedName,
+          storedName: file.filename,
+          localFilePath: file.path,
+          mimeType: file.mimetype || 'application/octet-stream',
+          size: file.size,
+        });
+      } catch (uploadErr) {
+        if (fs.existsSync(file.path)) {
+          try { fs.unlinkSync(file.path); } catch {}
+        }
+        throw uploadErr;
+      }
+
+      let newFile;
+      try {
+        newFile = await File.create({
+          originalName: sanitizedName,
+          storedName: file.filename,
+          filePath: uploadResult.filePath || file.path,
+          storageProvider: uploadResult.storageProvider || 'local',
+          storageKey: uploadResult.storageKey || null,
+          mimeType: file.mimetype || 'application/octet-stream',
+          extension: ext,
+          size: file.size,
+          category,
+          owner: req.user._id,
+          folder: targetFolder ? targetFolder._id : null,
+          shareToken: crypto.randomBytes(16).toString('hex'),
+        });
+      } catch (dbErr) {
+        // SAFE CLEANUP: If MongoDB creation fails, immediately remove the uploaded cloud/local file!
+        await storageEngine.deleteFile(req.user._id, file.filename, uploadResult.storageKey, uploadResult.storageProvider);
+        throw dbErr;
+      }
 
       createdFiles.push(newFile);
 
@@ -253,12 +281,57 @@ const getFileById = async (req, res, next) => {
   }
 };
 
+// Helper to verify file access (via share token, user ownership, or admin privileges)
+const authenticateFileAccess = async (req, file, shareToken) => {
+  // 1. If valid shareToken is provided, grant access
+  if (shareToken && file.shareToken && shareToken === file.shareToken) {
+    return { authorized: true };
+  }
+
+  // 2. If no shareToken, user authentication is required
+  let user = req.user;
+  if (!user) {
+    let token = null;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+      token = req.headers.authorization.split(' ')[1];
+    } else if (req.query && req.query.token) {
+      token = req.query.token;
+    }
+
+    if (!token) {
+      return { authorized: false, status: 401, message: 'Authentication required. No token or valid share link provided.' };
+    }
+
+    try {
+      const secret = process.env.JWT_SECRET;
+      const decoded = jwt.verify(token, secret || 'dev_secret_local_only_secure_file_hub_2026');
+      user = await User.findById(decoded.id).select('-password');
+      if (!user) {
+        return { authorized: false, status: 401, message: 'User belonging to this token no longer exists.' };
+      }
+      if (user.isBlocked) {
+        return { authorized: false, status: 403, message: 'Your account has been suspended by an administrator.' };
+      }
+      req.user = user;
+    } catch {
+      return { authorized: false, status: 401, message: 'Invalid or expired authorization token.' };
+    }
+  }
+
+  // 3. Check ownership or admin privileges
+  if (user.role === 'admin' || file.owner.toString() === user._id.toString()) {
+    return { authorized: true, user };
+  }
+
+  return { authorized: false, status: 403, message: 'Unauthorized access to this file.' };
+};
+
 // @desc    Download a file
 // @route   GET /api/files/:id/download
 // @access  Private (or via share token)
 const downloadFile = async (req, res, next) => {
   try {
-    const { shareToken } = req.query;
+    const { shareToken, redirect } = req.query;
     let file;
 
     if (shareToken) {
@@ -274,22 +347,25 @@ const downloadFile = async (req, res, next) => {
       });
     }
 
-    // Check ownership if not shared via token
-    if (!shareToken && req.user && file.owner.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
+    // Verify access rights (token ownership, share token, or admin)
+    const access = await authenticateFileAccess(req, file, shareToken);
+    if (!access.authorized) {
+      return res.status(access.status).json({
         success: false,
-        message: 'Unauthorized access to this file',
+        message: access.message,
       });
     }
 
-    const filePath = storageEngine.getFilePath(file.owner, file.storedName);
-
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({
-        success: false,
-        message: 'File content does not exist on disk',
-      });
+    // Optional short-lived signed URL redirect if requested and available
+    if (redirect === 'true' && (file.storageProvider === 's3' || file.storageProvider === 'r2')) {
+      const signedUrl = await storageEngine.getSignedDownloadUrl(file, 900); // 15 mins
+      if (signedUrl) {
+        return res.redirect(signedUrl);
+      }
     }
+
+    // Stream file content (works seamlessly for both Local and Cloud S3/R2)
+    const streamData = await storageEngine.getFileStream(file);
 
     // Update download count and access time
     file.downloadCount += 1;
@@ -309,11 +385,18 @@ const downloadFile = async (req, res, next) => {
 
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.originalName)}"`);
     res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Length', file.size);
+    if (streamData.contentLength) {
+      res.setHeader('Content-Length', streamData.contentLength);
+    }
 
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
+    streamData.stream.pipe(res);
   } catch (error) {
+    if (error.code === 'ENOENT' || error.name === 'NoSuchKey') {
+      return res.status(404).json({
+        success: false,
+        message: 'File content does not exist in storage',
+      });
+    }
     next(error);
   }
 };
@@ -323,7 +406,7 @@ const downloadFile = async (req, res, next) => {
 // @access  Private (or via share token)
 const previewFile = async (req, res, next) => {
   try {
-    const { shareToken } = req.query;
+    const { shareToken, redirect } = req.query;
     let file;
 
     if (shareToken) {
@@ -339,49 +422,99 @@ const previewFile = async (req, res, next) => {
       });
     }
 
-    if (!shareToken && req.user && file.owner.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
+    // Verify access rights (token ownership, share token, or admin)
+    const access = await authenticateFileAccess(req, file, shareToken);
+    if (!access.authorized) {
+      return res.status(access.status).json({
         success: false,
-        message: 'Unauthorized access',
+        message: access.message,
       });
     }
 
-    const filePath = storageEngine.getFilePath(file.owner, file.storedName);
+    // Optional presigned URL redirect for direct client rendering if requested
+    if (redirect === 'true' && (file.storageProvider === 's3' || file.storageProvider === 'r2')) {
+      const signedUrl = await storageEngine.getSignedPreviewUrl(file, 900);
+      if (signedUrl) {
+        return res.redirect(signedUrl);
+      }
+    }
 
-    if (!fs.existsSync(filePath)) {
+    // Stream content (supports HTTP Range headers for audio/video streaming on both local and S3/R2)
+    const range = req.headers.range;
+    const streamData = await storageEngine.getFileStream(file, range);
+
+    const headers = {
+      'Content-Type': streamData.contentType || file.mimeType || 'application/octet-stream',
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': `inline; filename="${encodeURIComponent(file.originalName)}"`,
+    };
+
+    if (streamData.contentLength) {
+      headers['Content-Length'] = streamData.contentLength;
+    }
+
+    if (streamData.isRange && streamData.contentRange) {
+      headers['Content-Range'] = streamData.contentRange;
+      res.writeHead(206, headers);
+    } else {
+      res.writeHead(200, headers);
+    }
+
+    streamData.stream.pipe(res);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.name === 'NoSuchKey') {
       return res.status(404).json({
         success: false,
-        message: 'File does not exist on disk',
+        message: 'File content does not exist in storage',
       });
     }
+    next(error);
+  }
+};
 
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
+// @desc    Get temporary signed URL for direct file access
+// @route   GET /api/files/:id/signed-url
+// @access  Private (or via share token)
+const getFileSignedUrl = async (req, res, next) => {
+  try {
+    const { shareToken, type = 'download' } = req.query;
+    let file;
 
-    // Handle range requests for video and audio streaming
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunksize = end - start + 1;
-      const fileStream = fs.createReadStream(filePath, { start, end });
-
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunksize,
-        'Content-Type': file.mimeType || 'application/octet-stream',
-      });
-      fileStream.pipe(res);
+    if (shareToken) {
+      file = await File.findOne({ _id: req.params.id, shareToken });
     } else {
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Content-Type': file.mimeType || 'application/octet-stream',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(file.originalName)}"`,
-      });
-      fs.createReadStream(filePath).pipe(res);
+      file = await File.findById(req.params.id);
     }
+
+    if (!file) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found',
+      });
+    }
+
+    // Verify access rights (token ownership, share token, or admin)
+    const access = await authenticateFileAccess(req, file, shareToken);
+    if (!access.authorized) {
+      return res.status(access.status).json({
+        success: false,
+        message: access.message,
+      });
+    }
+
+    let url = null;
+    if (file.storageProvider === 's3' || file.storageProvider === 'r2') {
+      url = type === 'preview'
+        ? await storageEngine.getSignedPreviewUrl(file, 3600)
+        : await storageEngine.getSignedDownloadUrl(file, 3600);
+    }
+
+    res.json({
+      success: true,
+      url,
+      provider: file.storageProvider || 'local',
+      expiresIn: url ? 3600 : null,
+    });
   } catch (error) {
     next(error);
   }
@@ -549,6 +682,7 @@ module.exports = {
   getFileById,
   downloadFile,
   previewFile,
+  getFileSignedUrl,
   updateFile,
   moveToTrash,
   batchActions,

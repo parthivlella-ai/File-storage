@@ -15,7 +15,18 @@ const fileSchema = new mongoose.Schema(
     },
     filePath: {
       type: String,
-      required: true,
+      default: '',
+    },
+    storageProvider: {
+      type: String,
+      enum: ['local', 's3', 'r2'],
+      default: 'local',
+      index: true,
+    },
+    storageKey: {
+      type: String,
+      default: null,
+      index: true,
     },
     mimeType: {
       type: String,

@@ -10,7 +10,7 @@ const protect = async (req, res, next) => {
   ) {
     token = req.headers.authorization.split(' ')[1];
   } else if (req.query && req.query.token) {
-    // Also support token in query parameter for direct download / media streams
+    // Support token in query parameter for direct download / media streams
     token = req.query.token;
   }
 
@@ -21,10 +21,18 @@ const protect = async (req, res, next) => {
     });
   }
 
+  const secret = process.env.JWT_SECRET;
+  if (!secret && process.env.NODE_ENV === 'production') {
+    return res.status(500).json({
+      success: false,
+      message: 'Server configuration error: JWT_SECRET is not configured',
+    });
+  }
+
   try {
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || 'super_secret_jwt_key_secure_file_hub_2026_x89f'
+      secret || 'dev_secret_local_only_secure_file_hub_2026'
     );
 
     const user = await User.findById(decoded.id).select('-password');
@@ -45,11 +53,18 @@ const protect = async (req, res, next) => {
     req.user = user;
     next();
   } catch (error) {
-    console.error('Auth verification error:', error.message);
-    return res.status(401).json({
-      success: false,
-      message: 'Not authorized, token is invalid or expired.',
-    });
+    if (
+      error.name === 'JsonWebTokenError' ||
+      error.name === 'TokenExpiredError' ||
+      error.name === 'SyntaxError'
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authorized, token is invalid or expired.',
+      });
+    }
+    // Pass unexpected internal/database errors to centralized error handler
+    next(error);
   }
 };
 

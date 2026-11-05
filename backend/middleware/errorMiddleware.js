@@ -31,19 +31,35 @@ const errorHandler = (err, req, res, next) => {
     message = 'Requested resource not found (invalid identifier).';
   }
 
+  // Handle CORS Origin Errors
+  if (err.message && err.message.startsWith('CORS Error:')) {
+    statusCode = 403;
+    message = err.message;
+  }
+
   // Handle Mongoose Duplicate Key Error
   if (err.code === 11000) {
     statusCode = 400;
-    const field = Object.keys(err.keyValue)[0];
+    const field = err.keyValue ? Object.keys(err.keyValue)[0] : 'field';
     message = `An entry with that ${field} already exists.`;
   }
 
-  // Handle Mongoose Validation Error
+  // Handle Validation Errors safely (Mongoose, express-rate-limit, or custom)
   if (err.name === 'ValidationError') {
     statusCode = 400;
-    message = Object.values(err.errors)
-      .map((val) => val.message)
-      .join(', ');
+    if (err.errors && typeof err.errors === 'object') {
+      message = Object.values(err.errors)
+        .map((val) => val.message || String(val))
+        .join(', ');
+    } else {
+      message = err.message || 'Validation error';
+    }
+  }
+
+  // Handle Mongoose connection / server selection timeout errors
+  if (err.name === 'MongooseServerSelectionError' || (err.message && err.message.includes('buffering timed out'))) {
+    statusCode = 503;
+    message = 'Database service is temporarily unavailable. Please try again shortly.';
   }
 
   // Handle JWT errors
@@ -56,11 +72,18 @@ const errorHandler = (err, req, res, next) => {
     message = 'Authentication token has expired. Please log in again.';
   }
 
-  console.error(`[Error] [${req.method} ${req.url}]:`, err.message);
+  // Diagnostic logging on server
+  console.error(`[Error] [${req.method} ${req.originalUrl || req.url}] (${statusCode}):`, err.message);
+
+  // In production, sanitize 500 error messages to avoid leaking internals
+  let clientMessage = message;
+  if (process.env.NODE_ENV === 'production' && statusCode === 500) {
+    clientMessage = 'An internal server error occurred. Please try again later.';
+  }
 
   res.status(statusCode).json({
     success: false,
-    message,
+    message: clientMessage,
     stack: process.env.NODE_ENV === 'production' ? null : err.stack,
   });
 };

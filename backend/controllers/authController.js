@@ -4,9 +4,13 @@ const File = require('../models/File');
 
 // Generate JWT token
 const generateToken = (id) => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret && process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL: JWT_SECRET environment variable is missing in production');
+  }
   return jwt.sign(
     { id },
-    process.env.JWT_SECRET || 'super_secret_jwt_key_secure_file_hub_2026_x89f',
+    secret || 'dev_secret_local_only_secure_file_hub_2026',
     {
       expiresIn: process.env.JWT_EXPIRES_IN || '7d',
     }

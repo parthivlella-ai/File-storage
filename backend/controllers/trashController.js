@@ -118,8 +118,8 @@ const permanentlyDeleteFile = async (req, res, next) => {
       });
     }
 
-    // Delete physical file from disk
-    storageEngine.deleteFile(req.user._id, file.storedName);
+    // Delete physical or cloud file from storage
+    await storageEngine.deleteFile(req.user._id, file.storedName, file.storageKey, file.storageProvider);
 
     // Deduct user storageUsed
     const user = await User.findById(req.user._id);
@@ -158,7 +158,7 @@ const permanentlyDeleteFolder = async (req, res, next) => {
     let totalDeduction = 0;
 
     for (const f of files) {
-      storageEngine.deleteFile(req.user._id, f.storedName);
+      await storageEngine.deleteFile(req.user._id, f.storedName, f.storageKey, f.storageProvider);
       totalDeduction += f.size || 0;
     }
 
@@ -190,7 +190,7 @@ const emptyTrash = async (req, res, next) => {
     let totalDeduction = 0;
 
     for (const f of trashedFiles) {
-      storageEngine.deleteFile(req.user._id, f.storedName);
+      await storageEngine.deleteFile(req.user._id, f.storedName, f.storageKey, f.storageProvider);
       totalDeduction += f.size || 0;
     }
 

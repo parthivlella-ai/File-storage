@@ -1,11 +1,25 @@
 import axios from 'axios';
 
-// Determine API Base URL (defaults to /api for local dev proxy)
-export const API_BASE_URL = (
-  import.meta.env.VITE_API_URL ||
-  import.meta.env.VITE_API_BASE_URL ||
-  '/api'
-).replace(/\/$/, '');
+/**
+ * Determine API Base URL using VITE_API_URL
+ * - In Production: Set VITE_API_URL=https://YOUR-BACKEND-DOMAIN/api (or https://YOUR-BACKEND-DOMAIN)
+ *   Guarantees the URL always routes to the backend's /api endpoint.
+ * - In Local Development: When VITE_API_URL is unset, defaults to '/api' which Vite proxies to http://localhost:5000
+ */
+const rawApiUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+
+export const API_BASE_URL = (() => {
+  if (rawApiUrl) {
+    // If it's a relative path like '/api', use it directly
+    if (rawApiUrl.startsWith('/')) {
+      return rawApiUrl;
+    }
+    // If it's a full URL, guarantee it ends with '/api'
+    return rawApiUrl.endsWith('/api') ? rawApiUrl : `${rawApiUrl}/api`;
+  }
+  // Local development default (routed via Vite dev server proxy configured in vite.config.js)
+  return '/api';
+})();
 
 const api = axios.create({
   baseURL: API_BASE_URL,
